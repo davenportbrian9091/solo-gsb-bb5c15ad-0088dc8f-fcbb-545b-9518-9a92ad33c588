@@ -14,6 +14,7 @@ GET    /api/analyses/{id}/rules              query rules (filters: status/action
 GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
 GET    /api/analyses/{id}/redundant-rules    per-rule removability inventory (recomputed LPM diff)
+GET    /api/analyses/{id}/source-retirement  per-source-tag whole-group withdrawal preview (recomputed LPM diff)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
@@ -43,6 +44,7 @@ from .merge_precheck import build_batch, merge_precheck
 from .observation_correction import ObservationCorrectionError, correct_observations
 from .quarantine_plan import QuarantinePlanError, plan_quarantine
 from .redundant import redundant_rule_inventory
+from .source_retirement import source_retirement_report
 from .schemas import (
     ActivateRequest,
     AnalyzeRequest,
@@ -437,6 +439,29 @@ def get_redundant_rules(analysis_id: str) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
     return redundant_rule_inventory(result)
+
+
+@app.get("/api/analyses/{analysis_id}/source-retirement")
+def get_source_retirement(analysis_id: str) -> dict[str, Any]:
+    """Preview withdrawing every rule of each source tag as one group.
+
+    For every distinct ``source_tag`` of the saved version, all of its rules
+    are removed together in their original order, the longest-prefix +
+    same-CIDR-priority analysis is recomputed on the remainder, and the final
+    effective actions (``permit``/``deny``/``none``) are compared against the
+    original version for both address families.  A source is
+    ``safe_to_retire`` only when no address changes action; per-source
+    ``changes`` carry the minimal CIDR ranges grouped by the six action
+    transitions, with exact address counts.  Removing the source's rules one
+    by one without effect does not imply group safety: the group removal is
+    always re-adjudicated as a whole.  Deleting the version's last rules is
+    compared against an empty rule set (everything unmatched).  Read-only:
+    nothing is persisted.
+    """
+    result = db.get_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+    return source_retirement_report(result)
 
 
 @app.get("/api/analyses/{analysis_id}/export.json")

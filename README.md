@@ -105,6 +105,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/decision-map?cidr=...` | 只读的 **CIDR 决策地图**：把查询网段切成最小 CIDR 分块，给出最终动作/胜出规则/完整匹配链 |
 | GET | `/api/analyses/{id}/redundant-rules` | **冗余规则盘点**：逐条移除规则并重算 LPM 裁决，标记可安全删除的规则（**不落库**） |
+| GET | `/api/analyses/{id}/source-retirement` | **来源撤场预演**：对每个 `source_tag` 一次性整组移除其全部规则并重算 LPM，给出可否整组撤场与按动作转变归类的最小 CIDR（**不落库**） |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
@@ -956,6 +957,124 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/redundant-rules"
 
 错误码：版本不存在 → `404`。
 
+### 来源整组撤场预演（source retirement）
+
+`GET /api/analyses/{id}/source-retirement` 回答"**某个来源（`source_tag`）的规则能不能整组
+下线**"：对已保存版本中**每个不同的 `source_tag`**，把该来源的**全部规则按原顺序一次性
+移除**，对剩余规则**重新执行最长前缀匹配（LPM）+ 同 CIDR 优先级裁决**，再与原版本逐地址
+比较 IPv4/IPv6 的**最终生效动作**（`permit`/`deny`/`none`，复用版本语义差异的几何算法，
+不枚举地址）。与冗余规则盘点一样，本端点**只读**：不新建分析版本、不写库、不修改基线，
+可安全重复调用。
+
+**整组判定绝不等于逐条判定之和**：即使该来源的每条规则**单独**删除都不影响任何地址，
+整组删除仍可能改变裁决——因此每个来源都是独立重算，而不是把逐条删除的结果合并。典型场景：
+
+- 同一 CIDR 上 winner 与落选 duplicate 同属一个来源：duplicate 单独删无影响，winner 单独删
+  时 duplicate 还在、动作由它接管也可能无影响，但**两条一起删**整个网段立刻失去覆盖；
+- 多条同动作规则互为兜底（被遮蔽的 deny /16 与盖住它的两个 deny /17 同一来源）：逐条删都
+  安全，整组删后 /16 整体回落到异动作祖先。
+
+返回顺序**固定**：来源按其在原提交顺序中**首次出现**的先后排列；每个来源的 `rule_ids`
+按**原提交顺序**列出（与规则 ID 字典序无关）；`changes` 中六种动作转变的排列与版本语义
+差异端点一致（`permit_to_deny` → `permit_to_none` → `deny_to_permit` → `deny_to_none`
+→ `none_to_permit` → `none_to_deny`，仅列确有地址变化的类型，IPv4 在 IPv6 前）。
+
+每个来源条目给出：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_tag` | 来源标签（规则未填时为 `default`） |
+| `rule_ids` | 撤场时将被一次性移除的全部规则 ID，**按原提交顺序** |
+| `rule_count` | 该来源规则数 |
+| `safe_to_retire` | 整组移除后是否**没有任何地址**改变最终动作（可整组撤场） |
+| `changed_addresses` | 整组撤场后动作发生变化的精确地址数（IPv4 + IPv6，IPv6 大整数精确给出） |
+| `changes` | 按六种动作转变归类的**最小 CIDR** 列表与精确地址数（结构同版本语义差异的 `changes`）；相邻同前缀兄弟块合并；撤场无影响时为 `[]` |
+| `summary` | 该来源的 IPv4/IPv6 分项与六种转变的地址计数（与版本语义差异 `summary` 同构） |
+
+**删光规则按全网未命中比较**：若版本只有一个来源（撤场后规则集为空），空集无法调用分析器，
+服务端以"全部地址均为 `none`"的合成结果参与比较，因此该来源的全部覆盖都会以
+`permit_to_none` / `deny_to_none` 出现在 `changes` 中。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/an_79764e286d728b72/source-retirement"
+```
+
+以上文三条规则版本（`permit 10.0.0.0/8` 来自 **core**；`deny 10.1.0.0/16` 与
+`permit 10.1.1.0/24` 同属 **edge**）为例，响应（节选）：
+
+```json
+{
+  "analysis_id": "an_79764e286d728b72",
+  "ruleset_hash": "79764e28...",
+  "analyzer_version": "1.0.0",
+  "summary": {"source_count": 2, "rule_count": 3, "safe_to_retire_count": 0},
+  "sources": [
+    {
+      "source_tag": "core",
+      "rule_ids": ["r1"],
+      "rule_count": 1,
+      "safe_to_retire": false,
+      "changed_addresses": 16711680,
+      "changes": [
+        {"ip_version": 4, "change_type": "permit_to_none",
+         "from_action": "permit", "to_action": null,
+         "address_count": 16711680, "range_count": 8,
+         "cidrs": ["10.0.0.0/16", "10.2.0.0/15", "10.4.0.0/14", "..."]}
+      ],
+      "summary": {"changed_addresses": 16711680, "change_groups": 1,
+                  "ipv4": {"...": "..."}, "ipv6": {"...": 0}}
+    },
+    {
+      "source_tag": "edge",
+      "rule_ids": ["r2", "r3"],
+      "rule_count": 2,
+      "safe_to_retire": false,
+      "changed_addresses": 65280,
+      "changes": [
+        {"ip_version": 4, "change_type": "deny_to_permit",
+         "from_action": "deny", "to_action": "permit",
+         "address_count": 65280, "range_count": 8,
+         "cidrs": ["10.1.0.0/24", "10.1.2.0/23", "10.1.4.0/22", "..."]}
+      ],
+      "summary": {"changed_addresses": 65280, "change_groups": 1,
+                  "ipv4": {"...": "..."}, "ipv6": {"...": 0}}
+    }
+  ]
+}
+```
+
+注意 edge 的两个片段：撤场后 /16 失去 deny 与 permit /24，整个 /16（65536 个地址）回落到
+core 的 permit /8——其中原 permit /24 洞（256 个地址）动作**不变**，故只有
+65536 − 256 = 65280 个地址计入 `deny_to_permit`，且差异以 /24 洞之外的最小 CIDR 碎片表示。
+
+**可整组撤场示例**：`permit 10.0.0.0/8`（core）内有一条 `permit 10.1.0.0/16`（edge），
+edge 虽实际转发流量（并非 shadowed），但整组下线后其范围由**同动作祖先**接管，该来源条目的
+`safe_to_retire: true`、`changed_addresses: 0`、`changes: []`：
+
+```json
+{
+  "source_tag": "edge",
+  "rule_ids": ["r2"],
+  "rule_count": 1,
+  "safe_to_retire": true,
+  "changed_addresses": 0,
+  "changes": [],
+  "summary": {"changed_addresses": 0, "change_groups": 0,
+              "ipv4": {"changed_addresses": 0, "change_groups": 0,
+                       "by_type": {"permit_to_deny": 0, "permit_to_none": 0,
+                                   "deny_to_permit": 0, "deny_to_none": 0,
+                                   "none_to_permit": 0, "none_to_deny": 0}},
+              "ipv6": {"...": "全 0"}}
+}
+```
+
+**逐条安全 ≠ 整组安全示例**：同一 CIDR 上 `permit(priority=10)` 与 `deny(priority=20)` 同属
+`hq` 来源时，冗余规则盘点中落选的 deny duplicate 可单独安全删除，但整组撤场会让整个
+`172.16.0.0/12`（2²⁰ 个地址）从 permit 变为 `none`，因此 `safe_to_retire: false`，
+`changes` 给出一组 `permit_to_none` 的最小 CIDR（此处即 `172.16.0.0/12` 本身）。
+
+错误码：版本不存在 → `404`。
+
 ### 版本语义差异（semantic diff）
 
 给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
@@ -1229,6 +1348,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── change_guard.py  # 变更守卫：授权条目解析/并集/重叠校验 + 未授权范围切割（纯函数，可独立使用）
 │   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
 │   ├── redundant.py     # 冗余规则盘点：逐条移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
+│   ├── source_retirement.py # 来源整组撤场预演：按 source_tag 一次性移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数，可独立使用）
 │   ├── quarantine_plan.py # 临时封禁方案：决策分块 + p0 同网段细分 + 真实分析/语义差异复核（纯函数，可独立使用）
@@ -1243,6 +1363,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_change_guard.py  # 变更守卫端点测试
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
 ├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
+├── tests/test_source_retirement.py # 来源整组撤场预演端点测试（首现顺序、整组重判、删空、IPv6、只读）
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
 ├── tests/test_quarantine_plan.py # 临时封禁方案端点测试（细分、阻碍网段、ID 撞号、IPv6）
