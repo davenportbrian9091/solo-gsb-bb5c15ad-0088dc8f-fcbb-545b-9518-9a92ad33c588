@@ -14,6 +14,7 @@ GET    /api/analyses/{id}/rules              query rules (filters: status/action
 GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
 GET    /api/analyses/{id}/redundant-rules    per-rule removability inventory (recomputed LPM diff)
+GET    /api/analyses/{id}/source-retirement  per-source-tag whole-group retirement inventory (recomputed LPM diff)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
@@ -54,6 +55,7 @@ from .schemas import (
     TrafficAuditRequest,
 )
 from .simulate import PatchError, apply_patch, rebuild_input_rules
+from .source_retirement import source_retirement_inventory
 from .traffic_audit import TrafficAuditError, audit_traffic
 
 
@@ -437,6 +439,29 @@ def get_redundant_rules(analysis_id: str) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
     return redundant_rule_inventory(result)
+
+
+@app.get("/api/analyses/{analysis_id}/source-retirement")
+def get_source_retirement(analysis_id: str) -> dict[str, Any]:
+    """Inventory the sources whose every rule can be retired together.
+
+    For each distinct ``source_tag`` of the saved version (in first-appearance
+    order), all rules of that source are removed at once — surviving rules
+    keep their original relative order — the longest-prefix analysis is
+    recomputed on the remainder, and the final effective actions
+    (``permit``/``deny``/``none``) are compared against the original version
+    for both address families.  A source is ``safe_to_retire`` only when no
+    address changes action; the verdict is always recomputed from the group
+    removal, never inferred from per-rule removability.  Each entry lists the
+    source's rule ids, the exact changed-address count and the minimal-CIDR
+    changes grouped by action transition.  A source carrying every rule is
+    compared against an all-``none`` surface.  Read-only: nothing is
+    persisted.
+    """
+    result = db.get_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+    return source_retirement_inventory(result)
 
 
 @app.get("/api/analyses/{analysis_id}/export.json")

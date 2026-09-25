@@ -105,6 +105,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/decision-map?cidr=...` | 只读的 **CIDR 决策地图**：把查询网段切成最小 CIDR 分块，给出最终动作/胜出规则/完整匹配链 |
 | GET | `/api/analyses/{id}/redundant-rules` | **冗余规则盘点**：逐条移除规则并重算 LPM 裁决，标记可安全删除的规则（**不落库**） |
+| GET | `/api/analyses/{id}/source-retirement` | **来源整组撤场盘点**：按 `source_tag` 一次性移除该来源全部规则并重算 LPM 裁决，标记可整组撤场的来源（**不落库**） |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
@@ -956,7 +957,95 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/redundant-rules"
 
 错误码：版本不存在 → `404`。
 
-### 版本语义差异（semantic diff）
+### 来源整组撤场盘点（source retirement）
+
+`GET /api/analyses/{id}/source-retirement` 盘点已保存版本中**哪些来源可以整组撤场**：
+对每个 `source_tag`（按其在原始提交中**首次出现的顺序**），服务端把该来源的**全部规则
+一次性移除**（幸存规则保持原有相对顺序，顺序仍参与同 CIDR 优先级裁决），对剩余规则
+**重新执行最长前缀裁决**，再与原版本逐地址比较 IPv4/IPv6 的**最终生效动作**
+（`permit`/`deny`/`none`，与版本语义差异同一套几何算法，不枚举地址）。只有**所有地址的
+动作都不变**时才标记 `safe_to_retire: true`。
+
+- 每个来源按原提交顺序返回其 `rule_ids`、`rule_count`、`safe_to_retire`、精确的变更地址数
+  `changed_addresses`（IPv4 + IPv6 合计，IPv6 大整数精确给出），以及 `changes`——按六种
+  动作转变归类的**最小 CIDR 与精确地址数**（结构与版本语义差异的 `changes` 完全一致）；
+- **整组判定永远重新计算，绝不从单条删除的结果推断**：同一来源的两条同 CIDR、同动作规则
+  各自单独删除都无影响（互相接管），但整组撤场会让它们共同把持的网段改变动作；
+- 某来源承载了版本的**全部规则**时，撤场后与**全网未命中**（所有地址为 `none`）的空规则集
+  比较，其全部有效范围按 `permit_to_none` / `deny_to_none` 报告；
+- 未填 `source_tag` 的规则归入 `default` 来源。
+
+盘点是**只读**的：不新建分析版本、不写库，结果顺序固定，可安全重复调用。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/source-retirement"
+```
+
+响应（上文 `dc-2026-09` 示例版本：四个来源各有一条规则，且都承载着裁决）：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "analyzer_version": "1.0.0",
+  "summary": {"source_count": 4, "rule_count": 4, "safe_to_retire_count": 0},
+  "sources": [
+    {
+      "source_tag": "hq",
+      "rule_ids": ["r1"],
+      "rule_count": 1,
+      "safe_to_retire": false,
+      "changed_addresses": 16711680,
+      "changes": [
+        {"ip_version": 4, "change_type": "permit_to_none",
+         "from_action": "permit", "to_action": null,
+         "address_count": 16711680, "range_count": 8,
+         "cidrs": ["10.0.0.0/13", "10.8.0.0/15", "10.11.0.0/16", "..."]}
+      ]
+    },
+    {
+      "source_tag": "dc1",
+      "rule_ids": ["r2"],
+      "rule_count": 1,
+      "safe_to_retire": false,
+      "changed_addresses": 65280,
+      "changes": [
+        {"ip_version": 4, "change_type": "deny_to_permit",
+         "from_action": "deny", "to_action": "permit",
+         "address_count": 65280, "range_count": 8,
+         "cidrs": ["10.10.0.0/24", "10.10.2.0/23", "..."]}
+      ]
+    },
+    {
+      "source_tag": "lab",
+      "rule_ids": ["r3"],
+      "rule_count": 1,
+      "safe_to_retire": false,
+      "changed_addresses": 256,
+      "changes": [
+        {"ip_version": 4, "change_type": "permit_to_deny",
+         "from_action": "permit", "to_action": "deny",
+         "address_count": 256, "range_count": 1, "cidrs": ["10.10.1.0/24"]}
+      ]
+    },
+    {
+      "source_tag": "v6",
+      "rule_ids": ["r4"],
+      "rule_count": 1,
+      "safe_to_retire": false,
+      "changed_addresses": 79228162514264337593543950336,
+      "changes": [
+        {"ip_version": 6, "change_type": "deny_to_none",
+         "from_action": "deny", "to_action": null,
+         "address_count": 79228162514264337593543950336,
+         "range_count": 1, "cidrs": ["2001:db8::/32"]}
+      ]
+    }
+  ]
+}
+```
+
+错误码：版本不存在 → `404`。
 
 给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
 `effective_cidrs` 内取该规则动作（`permit`/`deny`），没有任何规则匹配记为 `none`。差异按
@@ -1229,6 +1318,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── change_guard.py  # 变更守卫：授权条目解析/并集/重叠校验 + 未授权范围切割（纯函数，可独立使用）
 │   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
 │   ├── redundant.py     # 冗余规则盘点：逐条移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
+│   ├── source_retirement.py # 来源整组撤场盘点：按 source_tag 整组移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数，可独立使用）
 │   ├── quarantine_plan.py # 临时封禁方案：决策分块 + p0 同网段细分 + 真实分析/语义差异复核（纯函数，可独立使用）
@@ -1243,6 +1333,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_change_guard.py  # 变更守卫端点测试
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
 ├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
+├── tests/test_source_retirement.py # 来源整组撤场盘点端点测试（整组重判、删空比较、双地址族、只读）
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
 ├── tests/test_quarantine_plan.py # 临时封禁方案端点测试（细分、阻碍网段、ID 撞号、IPv6）
